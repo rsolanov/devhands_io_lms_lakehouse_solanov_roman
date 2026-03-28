@@ -1,0 +1,51 @@
+version: 2
+
+models:
+  - name: dds_customers
+    description: "DDS: измерение клиентов"
+    columns:
+      - name: customer_id
+        description: "Уникальный идентификатор клиента"
+        tests:
+          - unique
+          - not_null
+      - name: full_name
+        description: "Полное имя клиента (first_name + last_name)"
+      - name: email
+        description: "Email клиента"
+        tests:
+          - not_null
+
+  - name: dds_products
+    description: "DDS: измерение продуктов"
+    columns:
+      - name: product_id
+        description: "Уникальный идентификатор продукта"
+        tests:
+          - unique
+          - not_null
+      - name: product_name
+        description: "Название продукта"
+        tests:
+          - not_null
+
+  - name: dds_orders
+    description: "DDS: факт заказов"
+    columns:
+      - name: order_id
+        description: "Уникальный идентификатор заказа"
+        tests:
+          - unique
+          - not_null
+      - name: customer_id
+        description: "ID клиента (FK)"
+        tests:
+          - not_null
+      - name: product_id
+        description: "ID продукта (FK)"
+        tests:
+          - not_null
+      - name: total_amount
+        description: "Итоговая сумма заказа (quantity * price)"
+        tests:
+          - not_null

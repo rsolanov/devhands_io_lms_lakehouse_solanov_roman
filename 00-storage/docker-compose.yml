@@ -1,0 +1,320 @@
+networks:
+  lakehouse-shared:
+    name: lakehouse-shared
+    driver: bridge
+
+volumes:
+  minio-data:
+  postgres-metastore-data:
+
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: minio-storage
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - lakehouse-shared
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - lakehouse-shared
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set myminio http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin};
+      mc mb --ignore-existing myminio/product-bucket;
+      mc mb --ignore-existing myminio/platform-bucket;
+      mc anonymous set download myminio/product-bucket;
+      mc anonymous set download myminio/platform-bucket;
+      echo '✅ MinIO buckets created successfully';
+      exit 0;
+      "
+
+  # ============================================================================
+  # PostgreSQL Metastore (для Lakekeeper)
+  # ============================================================================
+  postgres-metastore:
+    image: postgres:18
+    container_name: postgres-metastore
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-lakekeeper}
+      POSTGRES_HOST_AUTH_METHOD: ${POSTGRES_HOST_AUTH_METHOD:-scram-sha-256}
+      POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS:---auth-host=scram-sha-256 --auth-local=trust}
+    volumes:
+      - postgres-metastore-data:/var/lib/postgresql
+    ports:
+      - "5433:5432"
+    networks:
+      - lakehouse-shared
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-lakekeeper}"]
+      interval: 5s
+      timeout: 5s
+      retries: 2
+      start_period: 10s
+    restart: unless-stopped
+
+  lakekeeper:
+    image: vakamo/lakekeeper:db5303c2-amd64
+    container_name: lakekeeper-catalog
+    command: serve
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres-metastore:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres-metastore:5432/lakekeeper
+      LAKEKEEPER__PG_ENCRYPTION_KEY: my-secret-key-minimum-32-characters-long-please-change
+      LAKEKEEPER__DEBUG__MIGRATE_BEFORE_SERVE: "true"
+      LAKEKEEPER__LISTEN_PORT: 8181
+      LAKEKEEPER__BIND_IP: 0.0.0.0
+      LAKEKEEPER__SERVE_SWAGGER_UI: "true"
+      LAKEKEEPER__ALLOW_ORIGIN: "*"
+      LAKEKEEPER__ENABLE_DEFAULT_PROJECT: "true"
+      LAKEKEEPER__SECRET_BACKEND: postgres
+      RUST_LOG: info
+    ports:
+      - "8181:8181"
+    networks:
+      - lakehouse-shared
+    depends_on:
+      postgres-metastore:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+  lakekeeper-bootstrap:
+    image: curlimages/curl:8.5.0
+    container_name: lakekeeper-bootstrap
+    networks:
+      - lakehouse-shared
+    depends_on:
+      lakekeeper:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEKEEPER_HOST: lakekeeper
+      LAKEKEEPER_PORT: 8181
+      LAKEKEEPER_PROJECT_ID: 00000000-0000-0000-0000-000000000000
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MAX_RETRIES: 60
+      RETRY_INTERVAL: 2
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+
+        API="http://$${LAKEKEEPER_HOST}:$${LAKEKEEPER_PORT}"
+
+        log() {
+          echo "[$(date -Iseconds)] [bootstrap] $$*"
+        }
+
+        wait_for_lakekeeper() {
+          log "⏳ Waiting for Lakekeeper to be ready..."
+          attempts=60
+          while [ $$attempts -gt 0 ]; do
+            if curl -fsS --max-time 2 "$${API}/health" >/dev/null 2>&1; then
+              log "✅ Lakekeeper is ready!"
+              return 0
+            fi
+            attempts=$$((attempts - 1))
+            log "Waiting... ($$attempts attempts left)"
+            sleep 2
+          done
+          log "❌ Lakekeeper did not become ready"
+          return 1
+        }
+
+        is_bootstrapped() {
+          info=$$(curl -fsS --max-time 5 "$${API}/management/v1/info" 2>/dev/null || echo "")
+          echo "$$info" | grep -q '"bootstrapped":true'
+        }
+
+        warehouse_exists() {
+          local wh_name="$$1"
+          resp=$$(curl -fsS --max-time 5 "$${API}/management/v1/warehouse" 2>/dev/null || echo "")
+          echo "$$resp" | grep -q "\"name\":\"$$wh_name\""
+        }
+
+        bootstrap_catalog() {
+          log "  Starting Lakekeeper bootstrap..."
+
+          if is_bootstrapped; then
+            log "✅ Catalog already bootstrapped"
+            return 0
+          fi
+
+          attempts=$${MAX_RETRIES}
+          while [ $$attempts -gt 0 ]; do
+            status=$$(curl -s -o /dev/null -w "%{http_code}" -X POST "$${API}/management/v1/bootstrap" \
+              -H "Content-Type: application/json" \
+              --data '{"accept-terms-of-use": true}' 2>/dev/null || echo "000")
+
+            case "$$status" in
+              200|201|204)
+                log "✅ Bootstrap completed (HTTP $$status)"
+                return 0
+                ;;
+              409|400)
+                if is_bootstrapped; then
+                  log "✅ Catalog already bootstrapped"
+                  return 0
+                fi
+                ;;
+            esac
+
+            attempts=$$((attempts - 1))
+            log "⏳ Bootstrap attempt failed (HTTP $$status), retrying... ($$attempts left)"
+            sleep $${RETRY_INTERVAL}
+          done
+
+          log "❌ Bootstrap failed after $${MAX_RETRIES} attempts"
+          return 1
+        }
+
+        create_warehouse() {
+          local wh_name="$$1"
+          local bucket="$$2"
+          local key_prefix="$$3"
+
+          log "  Creating warehouse '$$wh_name' in bucket '$$bucket'..."
+
+          if warehouse_exists "$$wh_name"; then
+            log "✅ Warehouse '$$wh_name' already exists"
+            return 0
+          fi
+
+          payload=$$(cat <<EOF
+        {
+          "warehouse-name": "$$wh_name",
+          "project-id": "$${LAKEKEEPER_PROJECT_ID}",
+          "storage-profile": {
+            "type": "s3",
+            "bucket": "$$bucket",
+            "key-prefix": "$$key_prefix",
+            "assume-role-arn": null,
+            "endpoint": "$${MINIO_ENDPOINT}",
+            "region": "us-east-1",
+            "path-style-access": true,
+            "flavor": "minio",
+            "sts-enabled": false,
+            "remote-signing-enabled": false
+          },
+          "storage-credential": {
+            "type": "s3",
+            "credential-type": "access-key",
+            "aws-access-key-id": "$${MINIO_ROOT_USER}",
+            "aws-secret-access-key": "$${MINIO_ROOT_PASSWORD}"
+          }
+        }
+        EOF
+        )
+
+          attempts=$${MAX_RETRIES}
+          while [ $$attempts -gt 0 ]; do
+            status=$$(curl -s -o /dev/null -w "%{http_code}" -X POST "$${API}/management/v1/warehouse" \
+              -H "Content-Type: application/json" \
+              --data "$$payload" 2>/dev/null || echo "000")
+
+            case "$$status" in
+              200|201|204)
+                log "✅ Warehouse '$$wh_name' created (HTTP $$status)"
+                return 0
+                ;;
+              409|400)
+                if warehouse_exists "$$wh_name"; then
+                  log "✅ Warehouse '$$wh_name' already exists"
+                  return 0
+                fi
+                ;;
+            esac
+
+            attempts=$$((attempts - 1))
+            log "  Warehouse creation failed (HTTP $$status), retrying... ($$attempts left)"
+            sleep $${RETRY_INTERVAL}
+          done
+
+          log "❌ Warehouse '$$wh_name' creation failed after $${MAX_RETRIES} attempts"
+          return 1
+        }
+
+        verify_warehouses() {
+          log "  Verifying warehouses..."
+          resp=$$(curl -fsS "$${API}/management/v1/warehouse" 2>/dev/null || echo "")
+
+          for wh_name in "product_dw" "dwh_dw"; do
+            if echo "$$resp" | grep -q "\"name\":\"$$wh_name\""; then
+              log "✅ Warehouse '$$wh_name' verified successfully"
+            else
+              log "⚠️  Could not verify warehouse '$$wh_name'"
+            fi
+          done
+
+          log "  Complete warehouse list:"
+          echo "$$resp" | grep -o '"name":"[^"]*"' || true
+        }
+
+        log "  Starting Lakekeeper bootstrap process..."
+        log "Creating two isolated Warehouses:"
+        log "  1. product_dw  -> product-bucket/warehouse"
+        log "  2. dwh_dw      -> platform-bucket/warehouse"
+
+        wait_for_lakekeeper || exit 1
+        bootstrap_catalog || exit 1
+        sleep 2
+
+        create_warehouse "product_dw" "product-bucket" "warehouse" || exit 1
+        sleep 1
+        create_warehouse "dwh_dw" "platform-bucket" "warehouse" || exit 1
+        sleep 2
+
+        verify_warehouses || true
+
+        log "  Bootstrap completed successfully!"
+        log "✅ Both Warehouses (product_dw, dwh_dw) are ready"
+    restart: "no"
+
+  test-runner:
+    image: python:3.11-slim
+    container_name: lakehouse-test
+    working_dir: /test
+    volumes:
+      - ./test:/test
+    networks:
+      - lakehouse-shared
+    depends_on:
+      lakekeeper-bootstrap:
+        condition: service_completed_successfully
+    command: >
+      bash -c "
+      echo '  Waiting for services...';
+      sleep 5;
+      echo '  Installing dependencies...';
+      pip install -q --no-cache-dir pyiceberg[pyarrow,s3fs]==0.7.1 pandas==2.2.0 requests==2.31.0;
+      echo '  Running PyIceberg test...';
+      python /test/test_pyiceberg.py;
+      "
+    profiles:
+      - test

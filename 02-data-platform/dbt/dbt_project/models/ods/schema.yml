@@ -1,0 +1,41 @@
+version: 2
+
+sources:
+  - name: product
+    database: iceberg_product
+    schema: product
+    tables:
+      - name: orders
+        description: "Заказы из продуктовой системы (product_dw warehouse)"
+      - name: customers
+        description: "Клиенты из продуктовой системы (product_dw warehouse)"
+      - name: products
+        description: "Продукты из продуктовой системы (product_dw warehouse)"
+
+models:
+  - name: ods_orders
+    description: "ODS слой для заказов"
+    columns:
+      - name: order_id
+        description: "Уникальный идентификатор заказа"
+        tests:
+          - unique
+          - not_null
+
+  - name: ods_customers
+    description: "ODS слой для клиентов"
+    columns:
+      - name: customer_id
+        description: "Уникальный идентификатор клиента"
+        tests:
+          - unique
+          - not_null
+
+  - name: ods_products
+    description: "ODS слой для продуктов"
+    columns:
+      - name: product_id
+        description: "Уникальный идентификатор продукта"
+        tests:
+          - unique
+          - not_null

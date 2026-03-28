@@ -1,0 +1,256 @@
+networks:
+  lakehouse-shared:
+    external: true
+    name: lakehouse-shared
+
+volumes:
+  platform-postgres-data:
+  trino-coordinator-data:
+  trino-worker-1-data:
+  trino-worker-2-data:
+  trino-worker-3-data:
+
+services:
+
+  # ============================================================================
+  # Platform PostgreSQL (изолированный, только для Airflow платформенного контура)
+  # ============================================================================
+  platform-postgres:
+    image: postgres:18
+    container_name: platform-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-airflow_platform}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-airflow_platform}
+      POSTGRES_DB: ${POSTGRES_DB:-airflow_platform}
+      POSTGRES_HOST_AUTH_METHOD: ${POSTGRES_HOST_AUTH_METHOD:-scram-sha-256}
+      POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS:---auth-host=scram-sha-256 --auth-local=trust}
+    volumes:
+      - platform-postgres-data:/var/lib/postgresql
+    ports:
+      - "5435:5432"
+    networks:
+      - lakehouse-shared
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-airflow_platform} -d ${POSTGRES_DB:-airflow_platform}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ============================================================================
+  # Trino Coordinator
+  # ============================================================================
+  trino-coordinator:
+    build:
+      context: ./trino
+      dockerfile: Dockerfile
+    container_name: platform-trino-coordinator
+    hostname: trino-coordinator
+    ports:
+      - "8085:8080"
+    volumes:
+      - ./trino/etc/coordinator:/etc/trino
+      - ./trino/etc/catalog:/etc/trino/catalog
+      - trino-coordinator-data:/data/trino
+    networks:
+      - lakehouse-shared
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  # ============================================================================
+  # Trino Worker 1
+  # ============================================================================
+  trino-worker-1:
+    build:
+      context: ./trino
+      dockerfile: Dockerfile
+    container_name: platform-trino-worker-1
+    hostname: trino-worker-1
+    volumes:
+      - ./trino/etc/worker:/etc/trino
+      - ./trino/etc/catalog:/etc/trino/catalog
+      - trino-worker-1-data:/data/trino
+    networks:
+      - lakehouse-shared
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      trino-coordinator:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ============================================================================
+  # Trino Worker 2
+  # ============================================================================
+  trino-worker-2:
+    build:
+      context: ./trino
+      dockerfile: Dockerfile
+    container_name: platform-trino-worker-2
+    hostname: trino-worker-2
+    volumes:
+      - ./trino/etc/worker:/etc/trino
+      - ./trino/etc/catalog:/etc/trino/catalog
+      - trino-worker-2-data:/data/trino
+    networks:
+      - lakehouse-shared
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      trino-coordinator:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ============================================================================
+  # Trino Worker 3
+  # ============================================================================
+  trino-worker-3:
+    build:
+      context: ./trino
+      dockerfile: Dockerfile
+    container_name: platform-trino-worker-3
+    hostname: trino-worker-3
+    volumes:
+      - ./trino/etc/worker:/etc/trino
+      - ./trino/etc/catalog:/etc/trino/catalog
+      - trino-worker-3-data:/data/trino
+    networks:
+      - lakehouse-shared
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      trino-coordinator:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ============================================================================
+  # dbt — изолированный образ для трансформаций (вызывается через DockerOperator)
+  # ============================================================================
+  dbt:
+    build:
+      context: ./dbt
+      dockerfile: Dockerfile
+    image: platform-dbt:latest
+    container_name: platform-dbt
+    env_file: .env
+    networks:
+      - lakehouse-shared
+    depends_on:
+      trino-coordinator:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ============================================================================
+  # Airflow Init
+  # ============================================================================
+  airflow-init:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: platform-airflow-init
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create \
+          --username ${AIRFLOW_ADMIN_USER:-admin} \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@platform.local \
+          --password ${AIRFLOW_ADMIN_PASSWORD:-admin}
+    env_file: .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow_platform}:${POSTGRES_PASSWORD:-airflow_platform}@platform-postgres:5432/${POSTGRES_DB:-airflow_platform}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+    networks:
+      - lakehouse-shared
+    depends_on:
+      platform-postgres:
+        condition: service_healthy
+    restart: on-failure
+
+  # ============================================================================
+  # Airflow Webserver
+  # ============================================================================
+  airflow-webserver:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: platform-airflow-webserver
+    command: webserver
+    env_file: .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow_platform}:${POSTGRES_PASSWORD:-airflow_platform}@platform-postgres:5432/${POSTGRES_DB:-airflow_platform}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8091:8080"
+    networks:
+      - lakehouse-shared
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      platform-postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      trino-coordinator:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ============================================================================
+  # Airflow Scheduler
+  # ============================================================================
+  airflow-scheduler:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: platform-airflow-scheduler
+    command: scheduler
+    env_file: .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow_platform}:${POSTGRES_PASSWORD:-airflow_platform}@platform-postgres:5432/${POSTGRES_DB:-airflow_platform}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - lakehouse-shared
+    depends_on:
+      platform-postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      trino-coordinator:
+        condition: service_healthy
+    restart: unless-stopped

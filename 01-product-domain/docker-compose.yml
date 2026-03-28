@@ -1,0 +1,181 @@
+x-spark-common: &spark-common
+  build:
+    context: ./spark
+    dockerfile: Dockerfile
+  env_file: .env
+  networks:
+    - lakehouse-shared
+  volumes:
+    - ./spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+
+volumes:
+  product-postgres-data:
+
+services:
+  # ============================================================================
+  # Продуктовый PostgreSQL (изолированный от 00-storage)
+  # ============================================================================
+  product-postgres:
+    image: postgres:18
+    container_name: product-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-airflow_product}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-airflow_product}
+      POSTGRES_DB: ${POSTGRES_DB:-airflow_product}
+      POSTGRES_HOST_AUTH_METHOD: ${POSTGRES_HOST_AUTH_METHOD:-scram-sha-256}
+      POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS:---auth-host=scram-sha-256 --auth-local=trust}
+    volumes:
+      - product-postgres-data:/var/lib/postgresql
+    ports:
+      - "5434:5432"
+    networks:
+      - lakehouse-shared
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-airflow_product} -d ${POSTGRES_DB:-airflow_product}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ============================================================================
+  # Spark Master
+  # ============================================================================
+  spark-master:
+    image: product-domain/spark-master:3.5.0
+    <<: *spark-common
+    container_name: product-spark-master
+    hostname: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ============================================================================
+  # Spark Worker
+  # ============================================================================
+  spark-worker:
+    image: product-domain/spark-worker:3.5.0
+    <<: *spark-common
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=1G
+      - SPARK_WORKER_CORES=16
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    deploy:
+      replicas: 3
+    depends_on:
+      spark-master:
+        condition: service_healthy
+
+  # ============================================================================
+  # Airflow Webserver
+  # ============================================================================
+  airflow-webserver:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: product-airflow-webserver
+    command: webserver
+    env_file: .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow_product}:${POSTGRES_PASSWORD:-airflow_product}@product-postgres:5432/${POSTGRES_DB:-airflow_product}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8090:8080"
+    networks:
+      - lakehouse-shared
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      product-postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ============================================================================
+  # Airflow Scheduler
+  # ============================================================================
+  airflow-scheduler:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: product-airflow-scheduler
+    command: scheduler
+    env_file: .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow_product}:${POSTGRES_PASSWORD:-airflow_product}@product-postgres:5432/${POSTGRES_DB:-airflow_product}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - lakehouse-shared
+    depends_on:
+      product-postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ============================================================================
+  # Airflow Init (миграции БД + создание admin-пользователя)
+  # ============================================================================
+  airflow-init:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: product-airflow-init
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create \
+          --username ${AIRFLOW_ADMIN_USER:-admin} \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@product.local \
+          --password ${AIRFLOW_ADMIN_PASSWORD:-admin}
+    env_file: .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow_product}:${POSTGRES_PASSWORD:-airflow_product}@product-postgres:5432/${POSTGRES_DB:-airflow_product}
+      AIRFLOW__CORE__LOAD_DEFAULT_CONNECTIONS: "False"
+    networks:
+      - lakehouse-shared
+    depends_on:
+      product-postgres:
+        condition: service_healthy
+    restart: on-failure
+
+networks:
+  lakehouse-shared:
+    external: true
+    name: lakehouse-shared

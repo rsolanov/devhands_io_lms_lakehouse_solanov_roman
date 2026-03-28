@@ -1,0 +1,44 @@
+version: 2
+
+models:
+  - name: dm_sales
+    description: "Витрина продаж с агрегацией по месяцам"
+    columns:
+      - name: customer_id
+        description: "ID клиента"
+        tests:
+          - not_null
+      - name: product_id
+        description: "ID продукта"
+        tests:
+          - not_null
+      - name: order_month
+        description: "Месяц заказа (DATE_TRUNC month)"
+        tests:
+          - not_null
+      - name: total_revenue
+        description: "Общая выручка за месяц"
+        tests:
+          - not_null
+
+  - name: dm_customer
+    description: "Метрики по клиентам"
+    columns:
+      - name: customer_id
+        description: "Уникальный ID клиента"
+        tests:
+          - unique
+          - not_null
+      - name: lifetime_value
+        description: "Общая сумма покупок клиента"
+
+  - name: dm_product
+    description: "Производительность продуктов"
+    columns:
+      - name: product_id
+        description: "Уникальный ID продукта"
+        tests:
+          - unique
+          - not_null
+      - name: total_revenue
+        description: "Общая выручка по продукту"

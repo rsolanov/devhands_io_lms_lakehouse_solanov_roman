@@ -1,0 +1,115 @@
+networks:
+  lakehouse-shared:
+    external: true
+    name: lakehouse-shared
+
+volumes:
+  bi-postgres-data:
+  superset-data:
+
+services:
+
+  # ============================================================================
+  # BI PostgreSQL (изолированный, только для метаданных Superset)
+  # ============================================================================
+  bi-postgres:
+    image: postgres:18
+    container_name: bi-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-superset}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-superset}
+      POSTGRES_DB: ${POSTGRES_DB:-superset}
+      POSTGRES_HOST_AUTH_METHOD: ${POSTGRES_HOST_AUTH_METHOD:-scram-sha-256}
+      POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS:---auth-host=scram-sha-256 --auth-local=trust}
+    volumes:
+      - bi-postgres-data:/var/lib/postgresql
+    ports:
+      - "5436:5432"
+    networks:
+      - lakehouse-shared
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-superset} -d ${POSTGRES_DB:-superset}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ============================================================================
+  # Superset Init (однократная инициализация: миграции БД, создание admin, sync ролей)
+  # ============================================================================
+  superset-init:
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    image: 03-bi-superset
+    container_name: bi-superset-init
+    env_file: .env
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-your-secret-key-here}
+      DATABASE_HOST: bi-postgres
+      DATABASE_PORT: "5432"
+      DATABASE_USER: ${POSTGRES_USER:-superset}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-superset}
+      DATABASE_DB: ${POSTGRES_DB:-superset}
+      SUPERSET_DATABASE_URI: postgresql+psycopg2://${POSTGRES_USER:-superset}:${POSTGRES_PASSWORD:-superset}@bi-postgres:5432/${POSTGRES_DB:-superset}
+    volumes:
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py
+      - superset-data:/app/superset_home
+    networks:
+      - lakehouse-shared
+    depends_on:
+      bi-postgres:
+        condition: service_healthy
+    restart: "no"
+    command:
+      - bash
+      - -c
+      - "superset db upgrade && superset fab create-admin --username $${SUPERSET_ADMIN_USERNAME:-admin} --firstname Admin --lastname User --email $${SUPERSET_ADMIN_EMAIL:-admin@superset.local} --password $${SUPERSET_ADMIN_PASSWORD:-admin} || true && superset init"
+
+  # ============================================================================
+  # Apache Superset
+  # ============================================================================
+  superset:
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    image: 03-bi-superset
+    container_name: bi-superset
+    hostname: superset
+    env_file: .env
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-your-secret-key-here}
+      DATABASE_HOST: bi-postgres
+      DATABASE_PORT: "5432"
+      DATABASE_USER: ${POSTGRES_USER:-superset}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-superset}
+      DATABASE_DB: ${POSTGRES_DB:-superset}
+      SUPERSET_DATABASE_URI: postgresql+psycopg2://${POSTGRES_USER:-superset}:${POSTGRES_PASSWORD:-superset}@bi-postgres:5432/${POSTGRES_DB:-superset}
+    ports:
+      - "8088:8088"
+    volumes:
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py
+      - superset-data:/app/superset_home
+    networks:
+      - lakehouse-shared
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8088/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      bi-postgres:
+        condition: service_healthy
+      superset-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    command:
+      - gunicorn
+      - --bind=0.0.0.0:8088
+      - --workers=4
+      - --timeout=120
+      - --limit-request-line=0
+      - --limit-request-field_size=0
+      - superset.app:create_app()
